@@ -30,11 +30,11 @@ const LOG_COLOR            = process.env.LOG_COLOR !== 'false' && process.stdout
 // ─── Freshness / refresh tunables ─────────────────────────
 const REFRESH_ENABLED            = process.env.REFRESH_ENABLED !== 'false';
 const REFRESH_INTERVAL_MS        = Number(process.env.REFRESH_INTERVAL_MS) || 24 * 60 * 60_000;
-const REFRESH_CONCURRENCY        = Number(process.env.REFRESH_CONCURRENCY) || 1;   // ← default 1
+const REFRESH_CONCURRENCY        = Number(process.env.REFRESH_CONCURRENCY) || 1;
 const REFRESH_BATCH              = Number(process.env.REFRESH_BATCH)       || 100;
 const REFRESH_BOOT_DELAY         = Number(process.env.REFRESH_BOOT_DELAY)  || 60_000;
 const REFRESH_RETRY_TTL          = Number(process.env.REFRESH_RETRY_TTL)   || 5 * 60_000;
-const REFRESH_INTER_REQUEST_DELAY_MS = Number(process.env.REFRESH_INTER_REQUEST_DELAY_MS) || 1000; // ← new
+const REFRESH_INTER_REQUEST_DELAY_MS = Number(process.env.REFRESH_INTER_REQUEST_DELAY_MS) || 1000;
 const ADMIN_TOKEN                = process.env.ADMIN_TOKEN || '';
 
 // ─── vidbolt.st API config ────────────────────────────────
@@ -45,6 +45,12 @@ const VIDBOLT_UA                = process.env.VIDBOLT_UA ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
 const VIDBOLT_SEC_CH_UA         = process.env.VIDBOLT_SEC_CH_UA ||
   '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"';
+
+// ─── Thumbnail proxy config ───────────────────────────────
+const PROXY_PUBLIC_BASE         = (process.env.PROXY_PUBLIC_BASE || '').replace(/\/+$/, '');
+const THUMB_SIGNING_SECRET      = process.env.THUMB_SIGNING_SECRET || ADMIN_TOKEN || crypto.randomBytes(32).toString('hex');
+const THUMB_PROXY_TIMEOUT       = Number(process.env.THUMB_PROXY_TIMEOUT) || 15_000;
+const THUMB_RATE_LIMIT_MAX      = Number(process.env.THUMB_RATE_LIMIT_MAX) || 3000;
 
 // ─── Upstream rate limiting ───────────────────────────────
 const VIDBOLT_MIN_INTERVAL_MS   = Number(process.env.VIDBOLT_MIN_INTERVAL_MS)   || 1000;
@@ -119,6 +125,7 @@ const TAG_STYLE = {
   server:    { icon: '🚀', color: C.green },
   http:      { icon: '🌐', color: C.white },
   proxy:     { icon: '🎬', color: C.magenta },
+  thumb:     { icon: '🖼️ ', color: C.cyan },
   queue:     { icon: '⏳', color: C.yellow },
   refresh:   { icon: '♻️ ', color: C.cyan },
   shutdown:  { icon: '🛑', color: C.red },
@@ -164,7 +171,7 @@ function log(level, tag, msg, extra) {
   const line =
     `${C.gray}${ts()}${C.reset}  ` +
     `${meta.color}${meta.icon}${C.reset}  ` +
-    `${tstyle.color}${String(tag || 'app').padEnd(8)}${C.reset} ` +   // ← space fixes "shutdownclosing"
+    `${tstyle.color}${String(tag || 'app').padEnd(8)}${C.reset} ` +
     `${C.white}${msg}${C.reset}` +
     extras;
 
@@ -176,7 +183,7 @@ function banner() {
     '',
     `${C.cyan}  ╭─────────────────────────────────────────────────────────────╮${C.reset}`,
     `${C.cyan}  │${C.reset}  ${C.bold}🎬  filmu.in stream proxy${C.reset}                                  ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}v3.8 · vidbolt.st · rate-limited · 429-aware sweep${C.reset}    ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}v3.9 · vidbolt.st · rate-limited · thumbnail proxy${C.reset}    ${C.cyan}│${C.reset}`,
     `${C.cyan}  ╰─────────────────────────────────────────────────────────────╯${C.reset}`,
     '',
   ];
@@ -191,6 +198,170 @@ function divider(label) {
   process.stdout.write(
     `\n${C.gray}  ${'─'.repeat(left)}${C.reset}${C.bold}${mid}${C.reset}${C.gray}${'─'.repeat(right)}${C.reset}\n`
   );
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  THUMBNAIL PROXY (signing + VTT rewriting)
+// ═══════════════════════════════════════════════════════════════
+function thumbSig(upstreamUrl) {
+  return crypto.createHmac('sha256', THUMB_SIGNING_SECRET)
+    .update(upstreamUrl, 'utf8')
+    .digest('base64url');
+}
+
+function buildThumbProxyUrl(upstreamUrl, req) {
+  if (!upstreamUrl || typeof upstreamUrl !== 'string') return upstreamUrl;
+  let base = PROXY_PUBLIC_BASE;
+  if (!base && req) {
+    const proto = req.protocol || 'https';
+    const host  = req.get('host') || req.hostname;
+    if (host) base = `${proto}://${host}`;
+  }
+  if (!base) return upstreamUrl;
+  const u = Buffer.from(upstreamUrl, 'utf8').toString('base64url');
+  const s = thumbSig(upstreamUrl);
+  return `${base}/api/thumb?u=${u}&s=${s}`;
+}
+
+function guessMime(pathname) {
+  const p = (pathname || '').toLowerCase();
+  if (p.endsWith('.jpg') || p.endsWith('.jpeg')) return 'image/jpeg';
+  if (p.endsWith('.png'))  return 'image/png';
+  if (p.endsWith('.webp')) return 'image/webp';
+  if (p.endsWith('.gif'))  return 'image/gif';
+  if (p.endsWith('.avif')) return 'image/avif';
+  if (p.endsWith('.vtt'))  return 'text/vtt; charset=utf-8';
+  return null;
+}
+
+const VTT_TIMESTAMP_RE = /^\s*\d{1,2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[.,]\d{3}/;
+const VTT_PAYLOAD_RE   = /^(\s*)([^\s#]+?)(#\S+)?(\s*)$/;
+const IMG_EXT_RE       = /\.(?:jpe?g|png|webp|gif|avif)(?:$|[?#])/i;
+
+function rewriteVtt(text, vttUrl, req) {
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let inCuePayload = false;
+
+  for (const line of lines) {
+    if (VTT_TIMESTAMP_RE.test(line)) {
+      out.push(line);
+      inCuePayload = true;
+      continue;
+    }
+    if (line.trim() === '') {
+      inCuePayload = false;
+      out.push(line);
+      continue;
+    }
+    if (inCuePayload) {
+      const m = VTT_PAYLOAD_RE.exec(line);
+      if (m) {
+        const rawRel = m[2];
+        if (IMG_EXT_RE.test(rawRel)) {
+          try {
+            const abs = new URL(rawRel, vttUrl).toString();
+            out.push(`${m[1]}${buildThumbProxyUrl(abs, req)}${m[3] || ''}${m[4]}`);
+            continue;
+          } catch { /* fall through */ }
+        }
+      }
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+async function proxyThumb(req, res) {
+  const { u, s } = req.query;
+  if (typeof u !== 'string' || typeof s !== 'string' || !u || !s) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+
+  let upstreamUrl;
+  try { upstreamUrl = Buffer.from(u, 'base64url').toString('utf8'); }
+  catch { return res.status(400).json({ error: 'bad_url' }); }
+
+  let parsed;
+  try { parsed = new URL(upstreamUrl); }
+  catch { return res.status(400).json({ error: 'bad_url' }); }
+
+  if (!/^https?:$/.test(parsed.protocol)) {
+    return res.status(400).json({ error: 'bad_protocol' });
+  }
+
+  // Constant-time signature verification
+  const expected = Buffer.from(thumbSig(upstreamUrl), 'utf8');
+  const provided = Buffer.from(s, 'utf8');
+  if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) {
+    log('warn', 'thumb', 'sig mismatch', { url: upstreamUrl.slice(0, 120) });
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), THUMB_PROXY_TIMEOUT);
+
+  try {
+    const upstreamRes = await fetch(upstreamUrl, {
+      headers: {
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
+        'accept-encoding': 'gzip, deflate, br',
+        // Must be vidbolt.st — the CDN 403s any other Origin/Referer
+        'origin':  VIDBOLT_BASE,
+        'referer': `${VIDBOLT_BASE}/`,
+        'user-agent': VIDBOLT_UA,
+        'sec-ch-ua': VIDBOLT_SEC_CH_UA,
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      },
+      redirect: 'follow',
+      signal: ctrl.signal,
+    });
+
+    if (!upstreamRes.ok) {
+      log('warn', 'thumb', 'upstream non-ok', { status: upstreamRes.status, url: upstreamUrl.slice(0, 120) });
+      return res.status(upstreamRes.status).json({ error: `upstream_${upstreamRes.status}` });
+    }
+
+    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    const upstreamCt = (upstreamRes.headers.get('content-type') || '').toLowerCase();
+    const headAscii  = buf.slice(0, 6).toString('ascii');
+    const isVtt      = upstreamCt.includes('text/vtt') || headAscii === 'WEBVTT' || /\.vtt($|\?)/i.test(upstreamUrl);
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    if (isVtt) {
+      const rewritten = rewriteVtt(buf.toString('utf8'), upstreamUrl, req);
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      return res.send(rewritten);
+    }
+
+    const ct = upstreamRes.headers.get('content-type') || guessMime(parsed.pathname) || 'application/octet-stream';
+    res.setHeader('Content-Type', ct);
+    const cc = upstreamRes.headers.get('cache-control');
+    res.setHeader('Cache-Control', cc || 'public, max-age=86400');
+    const etag = upstreamRes.headers.get('etag');
+    if (etag) res.setHeader('ETag', etag);
+    const lm = upstreamRes.headers.get('last-modified');
+    if (lm) res.setHeader('Last-Modified', lm);
+    res.setHeader('Content-Length', String(buf.length));
+    return res.end(buf);
+
+  } catch (err) {
+    log('warn', 'thumb', 'fetch error', { err: err.message, url: upstreamUrl.slice(0, 120) });
+    return res.status(502).json({ error: 'upstream_failed' });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -232,6 +403,8 @@ app.use((req, res, next) => {
 
   const q = { ...req.query };
   delete q.type;
+  delete q.u; // don't log signed thumbnail URLs (noisy)
+  delete q.s;
   const queryStr = Object.entries(q)
     .map(([k, v]) => `${C.gray}${k}${C.reset}${C.dim}=${C.reset}${C.white}${v}${C.reset}`)
     .join('  ');
@@ -264,7 +437,20 @@ app.use('/api', rateLimit({
   max: RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
+  // Sprite sheets can be many per VTT — they have their own limiter below.
+  skip: (req) => req.originalUrl.startsWith('/api/thumb'),
 }));
+
+const thumbLimiter = rateLimit({
+  windowMs: 60_000,
+  max: THUMB_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Thumbnail proxy — registered AFTER the /api rate limit but skipped above,
+// then throttled by its own generous limiter.
+app.get('/api/thumb', thumbLimiter, proxyThumb);
 
 // ═══════════════════════════════════════════════════════════════
 //  DB POOL + STATE
@@ -667,12 +853,10 @@ async function fetchFromVidbolt(mediaType, tmdb, s, e, budgetMs) {
   const startedAt = Date.now();
   const deadline = startedAt + (budgetMs || VIDBOLT_TIMEOUT);
 
-  // (1) Fast-bail on active backoff
   if (isUpstreamPaused()) {
     return { available: false, reason: 'upstream_backoff', pausedUntil: _upstreamPausedUntil };
   }
 
-  // (2) Min-interval gate (deadline-aware so we don't blow past the budget)
   const sinceLast = Date.now() - _lastUpstreamAt;
   if (sinceLast < VIDBOLT_MIN_INTERVAL_MS) {
     const wait = VIDBOLT_MIN_INTERVAL_MS - sinceLast;
@@ -724,7 +908,6 @@ async function fetchFromVidbolt(mediaType, tmdb, s, e, budgetMs) {
 
     const text = await res.text();
 
-    // (3) 429 handling
     if (res.status === 429) {
       const ra = parseRetryAfter(res.headers.get('retry-after'));
       noteUpstream429(ra);
@@ -762,6 +945,8 @@ async function fetchFromVidbolt(mediaType, tmdb, s, e, budgetMs) {
 }
 
 // Whittle to { server, sources:[{url,quality}], thumbnails, resolvedAt }
+// NOTE: `thumbnails` is kept as the ORIGINAL upstream URL in storage.
+//       It is rewritten to a signed proxy URL only at response-build time.
 function normalizeVidbolt(json) {
   if (!json || typeof json !== 'object') return null;
   const stream = json.stream || json;
@@ -808,7 +993,6 @@ function payloadsEquivalent(oldP, freshP) {
 function fetchFreshUpstream(mediaType, tmdb, s, e) {
   const flightKey = `fetch|${mediaType}|${tmdb}|${s}|${e}`;
   return singleFlight(flightKey, async () => {
-    // Fast-bail before the semaphore so a paused upstream never queues.
     if (isUpstreamPaused()) {
       return { available: false, reason: 'upstream_backoff', pausedUntil: _upstreamPausedUntil };
     }
@@ -988,8 +1172,14 @@ function buildMeta(result) {
     staleAfterHours: +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
   };
 }
-function buildResponse(result) {
+
+// Rewrites the upstream `thumbnails` URL to a signed proxy URL for the client,
+// while DB/cache continue to hold the original upstream URL.
+function buildResponse(result, req) {
   const clean = sanitizePayload(result.payload);
+  if (typeof clean.thumbnails === 'string' && clean.thumbnails) {
+    clean.thumbnails = buildThumbProxyUrl(clean.thumbnails, req);
+  }
   return {
     ...clean,
     _cached: mapCached(result.servedFrom),
@@ -1123,7 +1313,6 @@ async function runRefreshCycle() {
       lastId = rows[rows.length - 1].id;
       refreshState.lastTotal += rows.length;
 
-      // Sequential worker loop (concurrency=1 by default) with delay + backoff check
       const chunks = [];
       const chunkSize = Math.max(1, REFRESH_CONCURRENCY);
       for (let i = 0; i < rows.length; i += chunkSize) chunks.push(rows.slice(i, i + chunkSize));
@@ -1183,7 +1372,6 @@ async function runRefreshCycle() {
     refreshState.lastFinishedAt = new Date();
   }
 
-  // If aborted by backoff, retry after it expires (+30 s safety margin)
   if (abortedByBackoff) {
     const wait = Math.max(60_000, _upstreamPausedUntil - Date.now() + 30_000);
     scheduleRefreshRetry(wait);
@@ -1246,7 +1434,8 @@ async function streamHandler(req, res) {
     res.setHeader('x-data-matched', meta.matched ? '1' : '0');
     if (meta.updatedAt) res.setHeader('x-data-updated-at', meta.updatedAt);
 
-    const body = buildResponse(result);
+    // ← pass req so thumbnails get rewritten to signed proxy URLs
+    const body = buildResponse(result, req);
     if (result.negative) return res.status(404).json(body);
     return res.json(body);
 
@@ -1331,6 +1520,13 @@ app.get('/health', async (_req, res) => {
       lastInitError: dbState.lastInitError, retryScheduledAt: dbState.retryScheduledAt,
       stats: dbState.stats,
     },
+    thumbnails: {
+      proxyBase: PROXY_PUBLIC_BASE || '(derived from request)',
+      signing:  'hmac-sha256',
+      rateLimitPerMin: THUMB_RATE_LIMIT_MAX,
+      upstreamTimeoutMs: THUMB_PROXY_TIMEOUT,
+      rewritesVtt: true,
+    },
     mem: process.memoryUsage().rss,
     storage: {
       payloadFields: PAYLOAD_KEEP,
@@ -1396,6 +1592,8 @@ let shuttingDown = false;
       persistsMaster: false,
       dbReady: dbState.ready,
       dbIndexOk: dbState.indexOk,
+      thumbProxyBase: PROXY_PUBLIC_BASE || '(derived from request)',
+      thumbSigning: 'hmac-sha256',
     });
     log('info', 'server', 'cors allow-list', { hosts: [...ALLOWED_HOSTS].join(', ') });
 
