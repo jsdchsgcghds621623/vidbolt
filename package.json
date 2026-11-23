@@ -1,0 +1,35 @@
+{
+  "name": "api",
+  "version": "3.6.0",
+  "description": "DB-first stream proxy for vidbolt.st — lean payload storage (URLs + thumbnails VTT), source-aware refresh, provenance in every response.",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "dev:inspect": "node --inspect --watch server.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "compression": "^1.7.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "pg": "^8.13.1"
+  },
+  "keywords": [
+    "stream",
+    "proxy",
+    "vidbolt",
+    "tmdb",
+    "hls",
+    "postgres"
+  ]
+}
