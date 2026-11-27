@@ -128,6 +128,7 @@ const TAG_STYLE = {
   thumb:     { icon: '🖼️ ', color: C.cyan },
   queue:     { icon: '⏳', color: C.yellow },
   refresh:   { icon: '♻️ ', color: C.cyan },
+  orion:     { icon: '🏛️ ', color: C.green },
   shutdown:  { icon: '🛑', color: C.red },
   ready:     { icon: '✨', color: C.green },
 };
@@ -183,7 +184,7 @@ function banner() {
     '',
     `${C.cyan}  ╭─────────────────────────────────────────────────────────────╮${C.reset}`,
     `${C.cyan}  │${C.reset}  ${C.bold}🎬  filmu.in stream proxy${C.reset}                                  ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}v3.9 · vidbolt.st · rate-limited · thumbnail proxy${C.reset}    ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}v4.0 · vidbolt.st · orion-aware refresh${C.reset}              ${C.cyan}│${C.reset}`,
     `${C.cyan}  ╰─────────────────────────────────────────────────────────────╯${C.reset}`,
     '',
   ];
@@ -492,6 +493,7 @@ const dbState = {
     touchesOk: 0, touchesFailed: 0,
     legacyFieldsStripped: 0,
     thumbnailForcedRefreshes: 0,
+    orionSkippedRefreshes: 0,
     lastSaveError: null, lastSaveErrorAt: null,
     lastUpdateError: null, lastUpdateErrorAt: null,
   },
@@ -535,6 +537,16 @@ function noteUpstream429(retryAfterMs) {
 
 function isUpstreamPaused() {
   return Date.now() < _upstreamPausedUntil;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ORION DETECTION
+//  A row whose stored server is 'orion' is treated as immutable:
+//  it is NEVER sent back to vidbolt.st for a refresh.
+// ═══════════════════════════════════════════════════════════════
+function isOrionServer(payload) {
+  if (!payload || typeof payload.server !== 'string') return false;
+  return payload.server.trim().toLowerCase() === 'orion';
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1049,6 +1061,23 @@ async function resolveStream(mediaType, tmdb, s, e, key) {
       log('info', 'cache', 'db hit (missing thumbnails) — refreshing', { key, ageMin: Math.round(ageMs / 60_000) });
     }
 
+    // ── ORION PASSTHROUGH (on-demand path) ────────────────────
+    // If the stored server is orion we never hit vidbolt.st. We bump
+    // `updated_at` (so the row stops being "stale") and serve as-is.
+    if (isOrionServer(dbHit.payload)) {
+      dbState.stats.orionSkippedRefreshes++;
+      const touched = await touchDb(mediaType, tmdb, s, e);
+      const now = new Date();
+      memSet(key, dbHit.payload, now, CACHE_TTL);
+      log('ok', 'orion', 'orion row — kept as-is (no upstream fetch)', { key, touched });
+      return {
+        payload: dbHit.payload, servedFrom: 'database', outcome: 'orion_kept_as_is',
+        negative: dbHit.payload.available === false,
+        updated: false, matched: true, stale: false, verified: true,
+        updatedAt: now,
+      };
+    }
+
     const cap = await fetchFreshUpstream(mediaType, tmdb, s, e);
     const usable = cap.available && cap.data && Array.isArray(cap.data.sources) && cap.data.sources.length > 0;
 
@@ -1194,6 +1223,7 @@ const refreshState = {
   running: false,
   lastStartedAt: null, lastFinishedAt: null,
   lastTotal: 0, lastUpdated: 0, lastKept: 0, lastFailed: 0,
+  lastOrionSkipped: 0,
   lastError: null,
   lastAbortedReason: null,
   lastRetryScheduledAt: null,
@@ -1223,6 +1253,17 @@ async function refreshOne(row) {
   const episode = Number(row.episode);
   const key = `${mediaType}|${tmdb}|${season}|${episode}`;
   const oldPayload = sanitizePayload(row.payload);
+
+  // ── ORION PASSTHROUGH (background sweep path) ─────────────
+  // Never send an orion row back to vidbolt.st. We bump the
+  // timestamp so the row stops appearing in future stale batches,
+  // and record the skip in stats.
+  if (isOrionServer(oldPayload)) {
+    dbState.stats.orionSkippedRefreshes++;
+    const touched = await touchDb(mediaType, tmdb, season, episode);
+    log('ok', 'orion', 'orion row — kept as-is (no upstream fetch)', { key, touched });
+    return 'orion_skipped';
+  }
 
   if (isUpstreamPaused()) return 'paused';
 
@@ -1276,6 +1317,7 @@ async function runRefreshCycle() {
   refreshState.lastUpdated = 0;
   refreshState.lastKept = 0;
   refreshState.lastFailed = 0;
+  refreshState.lastOrionSkipped = 0;
   refreshState.lastError = null;
   refreshState.lastAbortedReason = null;
 
@@ -1289,6 +1331,7 @@ async function runRefreshCycle() {
     concurrency: REFRESH_CONCURRENCY,
     interDelayMs: REFRESH_INTER_REQUEST_DELAY_MS,
     minIntervalMs: VIDBOLT_MIN_INTERVAL_MS,
+    orionPolicy: 'skip (kept as-is, no upstream fetch)',
   });
 
   try {
@@ -1327,10 +1370,11 @@ async function runRefreshCycle() {
         }
         await Promise.all(chunk.map(async (row) => {
           const status = await refreshOne(row);
-          if (status === 'updated') refreshState.lastUpdated++;
-          else if (status === 'kept') refreshState.lastKept++;
-          else if (status === 'paused') { /* skip — aborted flag will trigger */ }
-          else refreshState.lastFailed++;
+          if (status === 'updated')             refreshState.lastUpdated++;
+          else if (status === 'kept')           refreshState.lastKept++;
+          else if (status === 'orion_skipped')  refreshState.lastOrionSkipped++;
+          else if (status === 'paused')         { /* skip — aborted flag will trigger */ }
+          else                                  refreshState.lastFailed++;
         }));
         if (REFRESH_INTER_REQUEST_DELAY_MS > 0 && chunks.length > 1) {
           await new Promise(r => setTimeout(r, REFRESH_INTER_REQUEST_DELAY_MS));
@@ -1352,6 +1396,7 @@ async function runRefreshCycle() {
         total: refreshState.lastTotal,
         updated: refreshState.lastUpdated,
         kept: refreshState.lastKept,
+        orionSkipped: refreshState.lastOrionSkipped,
         failed: refreshState.lastFailed,
         took: `${dur}s`,
       });
@@ -1360,6 +1405,7 @@ async function runRefreshCycle() {
         total: refreshState.lastTotal,
         updated: refreshState.lastUpdated,
         kept: refreshState.lastKept,
+        orionSkipped: refreshState.lastOrionSkipped,
         failed: refreshState.lastFailed,
         took: `${dur}s`,
       });
@@ -1394,6 +1440,7 @@ function startRefreshScheduler() {
     interDelayMs: REFRESH_INTER_REQUEST_DELAY_MS,
     minIntervalMs: VIDBOLT_MIN_INTERVAL_MS,
     batch: REFRESH_BATCH,
+    orionPolicy: 'skip (kept as-is)',
   });
 }
 
@@ -1484,6 +1531,7 @@ app.get('/api/admin/db-status', async (req, res) => {
         count(*) FILTER (WHERE created_at > now() - interval '1 day')::int  AS inserted_last_day,
         count(*) FILTER (WHERE updated_at > now() - interval '1 hour')::int AS updated_last_hour,
         count(*) FILTER (WHERE updated_at > now() - interval '1 day')::int  AS updated_last_day,
+        count(*) FILTER (WHERE lower(coalesce(payload->>'server','')) = 'orion')::int AS orion_rows,
         max(created_at) AS latest_insert, max(updated_at) AS latest_update
       FROM stream_cache
     `);
@@ -1535,6 +1583,7 @@ app.get('/health', async (_req, res) => {
       persistsThumbnails: true,
       stripsLegacyOnRead: true,
       thumbnailRetryMinutes: Math.round(THUMBNAIL_RETRY_MS / 60_000),
+      orionPassthrough: true,
     },
     freshness: {
       refreshIntervalHours: +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
@@ -1543,6 +1592,8 @@ app.get('/health', async (_req, res) => {
       keepAsIsOnMatch: 'urls+thumbnails',
       interRequestDelayMs: REFRESH_INTER_REQUEST_DELAY_MS,
       refreshConcurrency: REFRESH_CONCURRENCY,
+      orionRowsKeptAsIs: true,
+      orionPolicy: 'no upstream fetch — keep as-is, bump updated_at',
     },
     backgroundSweep: {
       enabled: REFRESH_ENABLED,
@@ -1552,6 +1603,7 @@ app.get('/health', async (_req, res) => {
       lastTotal: refreshState.lastTotal,
       lastUpdated: refreshState.lastUpdated,
       lastKept: refreshState.lastKept,
+      lastOrionSkipped: refreshState.lastOrionSkipped,
       lastFailed: refreshState.lastFailed,
       lastError: refreshState.lastError,
       lastAbortedReason: refreshState.lastAbortedReason,
@@ -1594,6 +1646,7 @@ let shuttingDown = false;
       dbIndexOk: dbState.indexOk,
       thumbProxyBase: PROXY_PUBLIC_BASE || '(derived from request)',
       thumbSigning: 'hmac-sha256',
+      orionPolicy: 'skip (kept as-is, no upstream fetch)',
     });
     log('info', 'server', 'cors allow-list', { hosts: [...ALLOWED_HOSTS].join(', ') });
 
